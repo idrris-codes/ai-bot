@@ -10,8 +10,8 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
-from aiogram.filters import CommandStart
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.filters import Command, CommandStart
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from openai import AsyncOpenAI
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -33,8 +33,8 @@ logging.basicConfig(level=logging.INFO)
 
 TEXTS = {
     "ru": {
-        "welcome": "Привет, {name}.\n\nЯ AI-бот. Пиши вопрос прямо в чат.\n\nНиже только нужные функции.",
-        "menu": "Главное меню",
+        "welcome": "Привет, {name}.\n\nЯ AI-бот. Пиши вопрос прямо в чат.\n\nГлавное меню находится ниже.",
+        "menu": "Главное меню открыто.",
         "thinking": "Думаю…",
         "error": "⚠️ Сейчас ИИ временно не ответил. Попробуй ещё раз чуть позже.",
         "empty_history": "История пока пустая.",
@@ -54,8 +54,8 @@ TEXTS = {
         "promo_text": "Разрабатываю Telegram-ботов и сайты под задачи бизнеса: автоматизация, заявки, AI-функции, лендинги и простые веб-решения.\n\nЕсли нужен проект — пиши разработчику: {username}",
     },
     "en": {
-        "welcome": "Hi, {name}.\n\nI am an AI bot. Just send your question.\n\nOnly the needed functions are below.",
-        "menu": "Main menu",
+        "welcome": "Hi, {name}.\n\nI am an AI bot. Just send your question.\n\nThe main menu is below.",
+        "menu": "Main menu is open.",
         "thinking": "Thinking…",
         "error": "⚠️ AI did not respond right now. Please try again a bit later.",
         "empty_history": "History is empty.",
@@ -254,30 +254,32 @@ def get_lang(user_id: int):
 
 def main_menu(user_id: int):
     lang = get_lang(user_id)
-    buttons = [
-        [InlineKeyboardButton(text=t(lang, "btn_style"), callback_data="settings:style")],
-        [InlineKeyboardButton(text=t(lang, "btn_export"), callback_data="history:export")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t(lang, "btn_style")), KeyboardButton(text=t(lang, "btn_export"))]],
+        resize_keyboard=True,
+        is_persistent=False,
+        input_field_placeholder="Напиши сообщение..." if lang == "ru" else "Type a message...",
+    )
 
 
 def style_menu(user_id: int):
     lang = get_lang(user_id)
-    buttons = [
-        [InlineKeyboardButton(text=t(lang, "btn_precise"), callback_data="style:precise")],
-        [InlineKeyboardButton(text=t(lang, "btn_short"), callback_data="style:short")],
-        [InlineKeyboardButton(text=t(lang, "btn_teacher"), callback_data="style:teacher")],
-        [InlineKeyboardButton(text=t(lang, "btn_custom"), callback_data="style:custom")],
-        [InlineKeyboardButton(text=t(lang, "btn_back"), callback_data="back:menu")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "btn_precise"), callback_data="style:precise")],
+            [InlineKeyboardButton(text=t(lang, "btn_short"), callback_data="style:short")],
+            [InlineKeyboardButton(text=t(lang, "btn_teacher"), callback_data="style:teacher")],
+            [InlineKeyboardButton(text=t(lang, "btn_custom"), callback_data="style:custom")],
+            [InlineKeyboardButton(text=t(lang, "btn_back"), callback_data="back:menu")],
+        ]
+    )
 
 
 def promo_text(lang: str):
     return f"{t(lang, 'promo_title')}\n\n{t(lang, 'promo_text', username=PROMO_USERNAME)}"
 
 
-async def send_long_message(message: Message, text: str, reply_markup=None):
+async def send_long_message(message: Message, text: str):
     chunks = []
     while text:
         if len(text) <= MAX_TELEGRAM_MESSAGE:
@@ -291,13 +293,8 @@ async def send_long_message(message: Message, text: str, reply_markup=None):
         else:
             chunks.append(cut)
             text = text[MAX_TELEGRAM_MESSAGE:]
-    first = True
     for chunk in chunks:
-        if first:
-            await message.answer(chunk, reply_markup=reply_markup)
-            first = False
-        else:
-            await message.answer(chunk)
+        await message.answer(chunk)
 
 
 def build_system_prompt(user: dict):
@@ -329,14 +326,20 @@ async def ask_ai(user: dict, user_text: str):
         model=OPENAI_MODEL,
         messages=messages,
         temperature=0.2,
-        extra_headers={
-            "HTTP-Referer": "https://railway.app",
-            "X-Title": "Telegram AI Bot",
-        },
+        extra_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Telegram AI Bot"},
         timeout=REQUEST_TIMEOUT,
     )
     text = response.choices[0].message.content or ""
     return text.strip()
+
+
+async def send_export(message: Message, user: dict):
+    data = db.export_history_text(message.from_user.id)
+    if not data:
+        await message.answer(t(user["language"], "empty_history"))
+        return
+    payload = BufferedInputFile(data.encode("utf-8"), filename=f"chat_history_{message.from_user.id}.txt")
+    await message.answer_document(payload, caption=t(user["language"], "export_ready"))
 
 
 async def promo_scheduler(bot: Bot):
@@ -352,11 +355,7 @@ async def promo_scheduler(bot: Bot):
                         if db.promo_already_sent(user_id, slot_key, date_key):
                             continue
                         try:
-                            await bot.send_message(
-                                user_id,
-                                promo_text(user["language"]),
-                                reply_markup=main_menu(user_id),
-                            )
+                            await bot.send_message(user_id, promo_text(user["language"]))
                             db.mark_promo_sent(user_id, slot_key, date_key)
                         except Exception as e:
                             logging.exception("Promo send error to %s: %s", user_id, e)
@@ -370,16 +369,18 @@ async def promo_scheduler(bot: Bot):
 async def start_handler(message: Message):
     if not message.from_user:
         return
-    db.upsert_user(
-        user_id=message.from_user.id,
-        username=message.from_user.username or "",
-        full_name=message.from_user.full_name or "",
-    )
+    db.upsert_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name or "")
     user = db.get_user(message.from_user.id)
-    await message.answer(
-        t(user["language"], "welcome", name=safe_name(message)),
-        reply_markup=main_menu(message.from_user.id),
-    )
+    await message.answer(t(user["language"], "welcome", name=safe_name(message)), reply_markup=main_menu(message.from_user.id))
+
+
+@router.message(Command("menu"))
+async def menu_handler(message: Message):
+    if not message.from_user:
+        return
+    db.upsert_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name or "")
+    user = db.get_user(message.from_user.id)
+    await message.answer(t(user["language"], "menu"), reply_markup=main_menu(message.from_user.id))
 
 
 @router.callback_query(F.data == "back:menu")
@@ -387,31 +388,7 @@ async def back_menu_handler(callback: CallbackQuery):
     if not callback.from_user or not callback.message:
         return
     user = db.get_user(callback.from_user.id)
-    await callback.message.edit_text(t(user["language"], "menu"), reply_markup=main_menu(callback.from_user.id))
-    await callback.answer()
-
-
-@router.callback_query(F.data == "settings:style")
-async def settings_style_handler(callback: CallbackQuery):
-    if not callback.from_user or not callback.message:
-        return
-    user = db.get_user(callback.from_user.id)
-    await callback.message.edit_text(t(user["language"], "choose_style"), reply_markup=style_menu(callback.from_user.id))
-    await callback.answer()
-
-
-@router.callback_query(F.data == "history:export")
-async def export_history_callback(callback: CallbackQuery):
-    if not callback.from_user or not callback.message:
-        return
-    user = db.get_user(callback.from_user.id)
-    data = db.export_history_text(callback.from_user.id)
-    if not data:
-        await callback.message.answer(t(user["language"], "empty_history"), reply_markup=main_menu(callback.from_user.id))
-        await callback.answer()
-        return
-    payload = BufferedInputFile(data.encode("utf-8"), filename=f"chat_history_{callback.from_user.id}.txt")
-    await callback.message.answer_document(payload, caption=t(user["language"], "export_ready"))
+    await callback.message.edit_text(t(user["language"], "menu"))
     await callback.answer()
 
 
@@ -424,13 +401,13 @@ async def style_change_handler(callback: CallbackQuery):
         db.update_user_field(callback.from_user.id, "style_key", "custom")
         db.update_user_field(callback.from_user.id, "awaiting_custom_style", 1)
         user = db.get_user(callback.from_user.id)
-        await callback.message.edit_text(t(user["language"], "ask_custom_style"), reply_markup=main_menu(callback.from_user.id))
+        await callback.message.edit_text(t(user["language"], "ask_custom_style"))
         await callback.answer()
         return
     db.update_user_field(callback.from_user.id, "style_key", style)
     db.update_user_field(callback.from_user.id, "awaiting_custom_style", 0)
     user = db.get_user(callback.from_user.id)
-    await callback.message.edit_text(t(user["language"], "style_changed"), reply_markup=main_menu(callback.from_user.id))
+    await callback.message.edit_text(t(user["language"], "style_changed"))
     await callback.answer()
 
 
@@ -438,24 +415,29 @@ async def style_change_handler(callback: CallbackQuery):
 async def text_handler(message: Message, bot: Bot):
     if not message.from_user or not message.text:
         return
-    db.upsert_user(
-        user_id=message.from_user.id,
-        username=message.from_user.username or "",
-        full_name=message.from_user.full_name or "",
-    )
+
+    db.upsert_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name or "")
     user = db.get_user(message.from_user.id)
+    lang = user["language"]
 
     if user["awaiting_custom_style"]:
         db.update_user_field(message.from_user.id, "custom_style", message.text.strip())
         db.update_user_field(message.from_user.id, "style_key", "custom")
         db.update_user_field(message.from_user.id, "awaiting_custom_style", 0)
-        user = db.get_user(message.from_user.id)
-        await message.answer(t(user["language"], "custom_style_saved"), reply_markup=main_menu(message.from_user.id))
+        await message.answer(t(lang, "custom_style_saved"))
+        return
+
+    if message.text == t(lang, "btn_style"):
+        await message.answer(t(lang, "choose_style"), reply_markup=style_menu(message.from_user.id))
+        return
+
+    if message.text == t(lang, "btn_export"):
+        await send_export(message, user)
         return
 
     db.add_message(message.from_user.id, "user", message.text.strip())
 
-    thinking_msg = await message.answer(t(user["language"], "thinking"))
+    thinking_msg = await message.answer(t(lang, "thinking"))
     try:
         with suppress(Exception):
             await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
@@ -465,20 +447,17 @@ async def text_handler(message: Message, bot: Bot):
         db.add_message(message.from_user.id, "assistant", answer)
         with suppress(Exception):
             await thinking_msg.delete()
-        await send_long_message(message, answer, reply_markup=main_menu(message.from_user.id))
+        await send_long_message(message, answer)
     except Exception as e:
         logging.exception("AI response error: %s", e)
         with suppress(Exception):
-            await thinking_msg.edit_text(t(user["language"], "error"), reply_markup=main_menu(message.from_user.id))
+            await thinking_msg.edit_text(t(lang, "error"))
 
 
 async def main():
     if not BOT_TOKEN or not OPENAI_API_KEY:
         raise RuntimeError("BOT_TOKEN or OPENAI_API_KEY is missing in environment variables.")
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
     asyncio.create_task(promo_scheduler(bot))
