@@ -4,6 +4,8 @@ import os
 import sqlite3
 import time
 from contextlib import suppress
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -15,11 +17,17 @@ from openai import AsyncOpenAI
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini")
+PROMO_USERNAME = os.getenv("PROMO_USERNAME", "@idris_codes")
 DB_PATH = "telegram_ai_bot.db"
 MAX_HISTORY_MESSAGES = 16
 MAX_TELEGRAM_MESSAGE = 4000
 REQUEST_TIMEOUT = 120
-AD_FREQUENCY = 6
+TIMEZONE = ZoneInfo("Asia/Dushanbe")
+PROMO_SLOTS = {
+    "morning": (9, 0),
+    "noon": (13, 0),
+    "night": (21, 0),
+}
 
 logging.basicConfig(level=logging.INFO)
 
@@ -42,12 +50,8 @@ TEXTS = {
         "btn_short": "✂️ Короткий",
         "btn_teacher": "📘 Понятный",
         "btn_custom": "✍️ Свой стиль",
-        "style_precise": "Точный",
-        "style_short": "Короткий",
-        "style_teacher": "Понятный",
-        "style_custom": "Свой стиль",
         "promo_title": "💻 Нужен Telegram-бот или сайт?",
-        "promo_text": "Разрабатываю Telegram-ботов и сайты под задачи бизнеса: автоматизация, заявки, AI-функции, лендинги и простые веб-решения.\n\nЕсли нужен проект — пиши разработчику: @idris_codes",
+        "promo_text": "Разрабатываю Telegram-ботов и сайты под задачи бизнеса: автоматизация, заявки, AI-функции, лендинги и простые веб-решения.\n\nЕсли нужен проект — пиши разработчику: {username}",
     },
     "en": {
         "welcome": "Hi, {name}.\n\nI am an AI bot. Just send your question.\n\nOnly the needed functions are below.",
@@ -67,12 +71,8 @@ TEXTS = {
         "btn_short": "✂️ Short",
         "btn_teacher": "📘 Clear",
         "btn_custom": "✍️ Custom",
-        "style_precise": "Precise",
-        "style_short": "Short",
-        "style_teacher": "Clear",
-        "style_custom": "Custom",
         "promo_title": "💻 Need a Telegram bot or website?",
-        "promo_text": "I build Telegram bots and websites for business needs: automation, leads, AI features, landing pages, and simple web solutions.\n\nFor a project, contact the developer: @idris_codes",
+        "promo_text": "I build Telegram bots and websites for business needs: automation, leads, AI features, landing pages, and simple web solutions.\n\nFor a project, contact the developer: {username}",
     },
 }
 
@@ -112,7 +112,6 @@ class Database:
                 style_key TEXT DEFAULT 'precise',
                 custom_style TEXT DEFAULT '',
                 awaiting_custom_style INTEGER DEFAULT 0,
-                reply_count INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -126,6 +125,16 @@ class Database:
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promo_log (
+                user_id INTEGER NOT NULL,
+                slot_key TEXT NOT NULL,
+                sent_date TEXT NOT NULL,
+                PRIMARY KEY (user_id, slot_key, sent_date)
             )
             """
         )
@@ -146,8 +155,8 @@ class Database:
                 """
                 INSERT INTO users (
                     user_id, username, full_name, language, style_key,
-                    custom_style, awaiting_custom_style, reply_count, created_at, updated_at
-                ) VALUES (?, ?, ?, 'ru', 'precise', '', 0, 0, ?, ?)
+                    custom_style, awaiting_custom_style, created_at, updated_at
+                ) VALUES (?, ?, ?, 'ru', 'precise', '', 0, ?, ?)
                 """,
                 (user_id, username, full_name, now, now),
             )
@@ -163,14 +172,14 @@ class Database:
             row = cur.fetchone()
         return dict(row)
 
+    def get_all_users(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM users ORDER BY user_id ASC")
+        return [dict(row) for row in cur.fetchall()]
+
     def update_user_field(self, user_id: int, field: str, value):
         cur = self.conn.cursor()
         cur.execute(f"UPDATE users SET {field}=?, updated_at=? WHERE user_id=?", (value, int(time.time()), user_id))
-        self.conn.commit()
-
-    def increment_reply_count(self, user_id: int):
-        cur = self.conn.cursor()
-        cur.execute("UPDATE users SET reply_count = reply_count + 1, updated_at=? WHERE user_id=?", (int(time.time()), user_id))
         self.conn.commit()
 
     def add_message(self, user_id: int, role: str, content: str):
@@ -202,6 +211,22 @@ class Database:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"]))
             parts.append(f"[{ts}] {row['role'].upper()}\n{row['content']}\n")
         return "\n".join(parts)
+
+    def promo_already_sent(self, user_id: int, slot_key: str, sent_date: str):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM promo_log WHERE user_id=? AND slot_key=? AND sent_date=?",
+            (user_id, slot_key, sent_date),
+        )
+        return cur.fetchone() is not None
+
+    def mark_promo_sent(self, user_id: int, slot_key: str, sent_date: str):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO promo_log (user_id, slot_key, sent_date) VALUES (?, ?, ?)",
+            (user_id, slot_key, sent_date),
+        )
+        self.conn.commit()
 
 
 db = Database(DB_PATH)
@@ -249,7 +274,7 @@ def style_menu(user_id: int):
 
 
 def promo_text(lang: str):
-    return f"{t(lang, 'promo_title')}\n\n{t(lang, 'promo_text')}"
+    return f"{t(lang, 'promo_title')}\n\n{t(lang, 'promo_text', username=PROMO_USERNAME)}"
 
 
 async def send_long_message(message: Message, text: str, reply_markup=None):
@@ -314,6 +339,33 @@ async def ask_ai(user: dict, user_text: str):
     return text.strip()
 
 
+async def promo_scheduler(bot: Bot):
+    while True:
+        try:
+            now = datetime.now(TIMEZONE)
+            date_key = now.strftime("%Y-%m-%d")
+            users = db.get_all_users()
+            for slot_key, (hour, minute) in PROMO_SLOTS.items():
+                if now.hour == hour and now.minute == minute:
+                    for user in users:
+                        user_id = user["user_id"]
+                        if db.promo_already_sent(user_id, slot_key, date_key):
+                            continue
+                        try:
+                            await bot.send_message(
+                                user_id,
+                                promo_text(user["language"]),
+                                reply_markup=main_menu(user_id),
+                            )
+                            db.mark_promo_sent(user_id, slot_key, date_key)
+                        except Exception as e:
+                            logging.exception("Promo send error to %s: %s", user_id, e)
+            await asyncio.sleep(30)
+        except Exception as e:
+            logging.exception("Promo scheduler error: %s", e)
+            await asyncio.sleep(30)
+
+
 @router.message(CommandStart())
 async def start_handler(message: Message):
     if not message.from_user:
@@ -324,8 +376,10 @@ async def start_handler(message: Message):
         full_name=message.from_user.full_name or "",
     )
     user = db.get_user(message.from_user.id)
-    welcome = f"{t(user['language'], 'welcome', name=safe_name(message))}\n\n{promo_text(user['language'])}"
-    await message.answer(welcome, reply_markup=main_menu(message.from_user.id))
+    await message.answer(
+        t(user["language"], "welcome", name=safe_name(message)),
+        reply_markup=main_menu(message.from_user.id),
+    )
 
 
 @router.callback_query(F.data == "back:menu")
@@ -357,8 +411,7 @@ async def export_history_callback(callback: CallbackQuery):
         await callback.answer()
         return
     payload = BufferedInputFile(data.encode("utf-8"), filename=f"chat_history_{callback.from_user.id}.txt")
-    caption = f"{t(user['language'], 'export_ready')}\n\n{promo_text(user['language'])}"
-    await callback.message.answer_document(payload, caption=caption)
+    await callback.message.answer_document(payload, caption=t(user["language"], "export_ready"))
     await callback.answer()
 
 
@@ -410,10 +463,6 @@ async def text_handler(message: Message, bot: Bot):
         if not answer:
             raise RuntimeError("empty ai response")
         db.add_message(message.from_user.id, "assistant", answer)
-        db.increment_reply_count(message.from_user.id)
-        user = db.get_user(message.from_user.id)
-        if user["reply_count"] % AD_FREQUENCY == 0:
-            answer = f"{answer}\n\n{promo_text(user['language'])}"
         with suppress(Exception):
             await thinking_msg.delete()
         await send_long_message(message, answer, reply_markup=main_menu(message.from_user.id))
@@ -432,6 +481,7 @@ async def main():
     )
     dp = Dispatcher()
     dp.include_router(router)
+    asyncio.create_task(promo_scheduler(bot))
     await dp.start_polling(bot)
 
 
